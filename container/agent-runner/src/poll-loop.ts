@@ -6,7 +6,7 @@ import {
   markScriptSkipped,
   type MessageInRow,
 } from './db/messages-in.js';
-import { getUndeliveredMessages, writeMessageOut, type MessageOutRow } from './db/messages-out.js';
+import { getMessageIdBySeq, getUndeliveredMessages, writeMessageOut, type MessageOutRow } from './db/messages-out.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
 import { resolveDestinationThread } from './db/session-routing.js';
 import { touchHeartbeat } from './heartbeat.js';
@@ -619,7 +619,7 @@ export async function processQuery(
         const resultText = event.text ?? '';
         const failed = event.isError === true;
         if (resultText || failed) {
-          const { hasUnwrapped, taskBlocks, undelivered } = await dispatchResultText(resultText, routing, {
+          const { hasUnwrapped, replied, taskBlocks, undelivered } = await dispatchResultText(resultText, routing, {
             midTurnSent,
             midTurnReplied,
             turnStartSeq,
@@ -652,7 +652,17 @@ export async function processQuery(
           // An unwrapped final text only warrants the wrap-nudge when no
           // <message> block was delivered this turn. If a reply already went
           // out as a block, the unwrapped tail stays in the scratchpad log.
-          const willRetryWrapping = !failed && hasUnwrapped && !unwrappedNudged;
+          // Everything that went out this turn: tool sends, door sends and
+          // reactions alike, so a reaction-only turn can also answer done.
+          const sentThisTurn =
+            !failed && !unwrappedNudged && !routing.taskRun && (hasUnwrapped || replied === 0)
+              ? chatRowsInWindow(turnStartSeq)
+              : [];
+          // A final text of only <internal> spans after a send settles nothing
+          // either: a status edited to "done" can stand in for an answer that
+          // never went out. The model sees what went out and decides.
+          const silentAfterSend = !hasUnwrapped && replied === 0 && sentThisTurn.length > 0;
+          const willRetryWrapping = !failed && (hasUnwrapped || silentAfterSend) && !unwrappedNudged;
           notifyExchangeComplete(onExchangeComplete, {
             prompt: archivePrompts[0] ?? initialPrompt,
             result: archivedResult,
@@ -661,21 +671,27 @@ export async function processQuery(
           });
           if (willRetryWrapping) {
             unwrappedNudged = true;
-            // Everything that went out this turn: tool sends, door sends and
-            // reactions alike, so a reaction-only turn can also answer done.
-            const sentThisTurn = chatRowsInWindow(turnStartSeq);
             const destinations = getAllDestinations();
             const names = destinations.map((d) => d.name).join(', ');
             // A tool send can't be told apart from an "on it" ack, so after
             // one the model sees what went out and decides; never a silent drop.
             log(
-              sentThisTurn.length > 0
-                ? `Wrap-nudge pushed: quoting ${sentThisTurn.length} send(s) from this turn`
-                : 'Wrap-nudge pushed: nothing was sent this turn',
+              silentAfterSend
+                ? `Wrap-nudge pushed: turn ended in <internal> after ${sentThisTurn.length} send(s), none a reply block`
+                : sentThisTurn.length > 0
+                  ? `Wrap-nudge pushed: quoting ${sentThisTurn.length} send(s) from this turn`
+                  : 'Wrap-nudge pushed: nothing was sent this turn',
             );
             pushRetry(
               sentThisTurn.length > 0
-                ? buildInformedWrapNudge(sentThisTurn, undelivered, destinations)
+                ? buildInformedWrapNudge(sentThisTurn, undelivered, destinations, (seq) => {
+                    // A lookup error leaves the plain informed nudge.
+                    try {
+                      return getMessageIdBySeq(seq);
+                    } catch {
+                      return null;
+                    }
+                  })
                 : `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
                     `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
                     `Your destinations: ${names}. ` +
@@ -1068,15 +1084,17 @@ const INFORMED_NUDGE_QUOTE_MAX = 200;
 const INFORMED_NUDGE_ROWS_MAX = 3;
 
 /**
- * Wrap-nudge after tool sends plus an unwrapped final text. The rows can't
- * tell an "on it" from the full reply, so show the model both and let it
- * answer `<internal>done</internal>` or send only what is missing. Quoting
- * the final text also ties a retry queued behind a follow-up to its turn.
+ * Wrap-nudge after tool sends plus an unwrapped (or `<internal>`-only, when
+ * `finalText` is empty) final text. The rows can't tell an "on it" from the
+ * full reply, so show the model both and let it answer
+ * `<internal>done</internal>` or send only what is missing. Quoting the final
+ * text also ties a retry queued behind a follow-up to its turn.
  */
 export function buildInformedWrapNudge(
   rows: MessageOutRow[],
   finalText: string,
   destinations: DestinationEntry[],
+  platformIdOf: (seq: number) => string | null = () => null,
 ): string {
   const names = destinations.map((d) => d.name).join(', ');
   // Name where each send went, so a reply sent to the wrong place is not taken as done.
@@ -1087,33 +1105,59 @@ export function buildInformedWrapNudge(
         : row.channel_type === d.channelType && row.platform_id === d.platformId,
     )?.name ?? 'unknown';
   const clip = (text: string): string => escapePromptXml(clipCodePoints(text, INFORMED_NUDGE_QUOTE_MAX));
-  const sent = rows.slice(0, INFORMED_NUDGE_ROWS_MAX).map((row) => {
-    let text = '';
+  type SentContent = { text?: unknown; files?: unknown; operation?: unknown; emoji?: unknown; messageId?: unknown };
+  const parsed = rows.map((row) => {
     try {
-      const content = JSON.parse(row.content) as {
-        text?: unknown;
-        files?: unknown;
-        operation?: unknown;
-        emoji?: unknown;
-      };
-      const files = Array.isArray(content.files) ? `[file: ${content.files.join(', ')}]` : '';
-      // A reaction is quoted as one, so the model can tell it from a reply.
-      text =
-        content.operation === 'reaction'
-          ? `[reaction: ${typeof content.emoji === 'string' ? content.emoji : '?'}]`
-          : [typeof content.text === 'string' ? content.text : '', files].filter(Boolean).join(' ');
+      return { row, content: JSON.parse(row.content) as SentContent };
     } catch {
-      // Unparseable row: quote a placeholder.
+      // Unparseable row: quoted as a placeholder.
+      return { row, content: {} as SentContent };
     }
+  });
+  // Edits that overwrote every new message of the turn leave the user with
+  // status lines only. Shown edits and sends alone, the model still answers
+  // done (it took its own thinking for the reply), so say it outright. An
+  // edit names its target by platform id, or by the outbound id when the
+  // target was not delivered yet; an unparseable row counts as an answer.
+  const editTargets = new Set(parsed.filter((p) => p.content.operation === 'edit').map((p) => p.content.messageId));
+  // A turn that only edited earlier messages sent nothing new to overwrite.
+  const newMessages = parsed.filter((p) => p.content.operation !== 'edit' && p.content.operation !== 'reaction');
+  const statusOnly =
+    editTargets.size > 0 &&
+    newMessages.length > 0 &&
+    newMessages.every((p) => editTargets.has(p.row.id) || editTargets.has(platformIdOf(p.row.seq ?? 0)));
+  // New messages first: a status edit must not crowd the answer out of the list.
+  const ordered = [
+    ...parsed.filter((p) => p.content.operation !== 'edit'),
+    ...parsed.filter((p) => p.content.operation === 'edit'),
+  ];
+  const sent = ordered.slice(0, INFORMED_NUDGE_ROWS_MAX).map(({ row, content }) => {
+    const files = Array.isArray(content.files) ? `[file: ${content.files.join(', ')}]` : '';
+    const body = [typeof content.text === 'string' ? content.text : '', files].filter(Boolean).join(' ');
+    // A reaction or an edit is quoted as one, so the model can tell it from a reply.
+    const text =
+      content.operation === 'reaction'
+        ? `[reaction: ${typeof content.emoji === 'string' ? content.emoji : '?'}]`
+        : content.operation === 'edit'
+          ? `[edit of an earlier message] ${body}`
+          : body;
     return `<sent_message to="${escapePromptXml(destinationOf(row))}">${clip(text || '[non-text message]')}</sent_message>`;
   });
   if (rows.length > INFORMED_NUDGE_ROWS_MAX) sent.push(`(+${rows.length - INFORMED_NUDGE_ROWS_MAX} more)`);
+  const header = finalText
+    ? `<system>Your final text was not delivered — it was not wrapped in <message to="name">...</message> blocks:\n` +
+      `<undelivered_text>${clip(finalText)}</undelivered_text>\n`
+    : `<system>Your turn ended with only <internal> text.\n`;
   return (
-    `<system>Your final text was not delivered — it was not wrapped in <message to="name">...</message> blocks:\n` +
-    `<undelivered_text>${clip(finalText)}</undelivered_text>\n` +
+    header +
     `Earlier in that turn you already sent:\n${sent.join('\n')}\n` +
-    `If what was sent is the full reply, to where it was owed, respond with only <internal>done</internal> and nothing more will be sent. ` +
-    `Otherwise send only what is still missing, wrapped in <message to="name">...</message>, without repeating what already went out. ` +
+    (statusOnly
+      ? `Every message you sent in that turn was then overwritten by an edit, so the user has seen only status lines, not an answer. ` +
+        `Your thinking is never shown to anyone. ` +
+        `Send the answer now as a new message, wrapped in <message to="name">...</message>, without repeating the status lines. `
+      : `A status or progress message, or an edit of one, is not the reply. ` +
+        `If what was sent is the full reply, to where it was owed, respond with only <internal>done</internal> and nothing more will be sent. ` +
+        `Otherwise send only what is still missing, wrapped in <message to="name">...</message>, without repeating what already went out. `) +
     `Your destinations: ${escapePromptXml(names)}.</system>`
   );
 }
@@ -1174,7 +1218,13 @@ export async function dispatchResultText(
   text: string,
   routing: RoutingContext,
   options?: ResultDispatchOptions,
-): Promise<{ sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[]; undelivered: string }> {
+): Promise<{
+  sent: number;
+  replied: number;
+  hasUnwrapped: boolean;
+  taskBlocks: TaskMessageBlock[];
+  undelivered: string;
+}> {
   // <internal> spans are not-for-delivery scratchpad. Remove them BEFORE block
   // extraction so a <message> drafted inside one is never delivered from the
   // final text either — the mid-turn seam already guarantees this; without the
@@ -1285,7 +1335,7 @@ export async function dispatchResultText(
         : `WARNING: agent output had no <message to="..."> blocks — nothing was sent`,
     );
   }
-  return { sent, hasUnwrapped, taskBlocks, undelivered: scratchpad };
+  return { sent, replied, hasUnwrapped, taskBlocks, undelivered: scratchpad };
 }
 
 /**
