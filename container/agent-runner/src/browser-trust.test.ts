@@ -12,14 +12,19 @@ let calls: string[][];
 const run = (cmd: string, args: string[]) => {
   calls.push([cmd, ...args]);
 };
+// An unset caPath falls back to NODE_EXTRA_CA_CERTS; keep the host's out.
+const savedExtraCa = process.env.NODE_EXTRA_CA_CERTS;
 
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-trust-'));
   calls = [];
+  delete process.env.NODE_EXTRA_CA_CERTS;
 });
 
 afterEach(() => {
   fs.rmSync(dir, { recursive: true, force: true });
+  if (savedExtraCa === undefined) delete process.env.NODE_EXTRA_CA_CERTS;
+  else process.env.NODE_EXTRA_CA_CERTS = savedExtraCa;
 });
 
 describe('trustGatewayCaForChromium', () => {
